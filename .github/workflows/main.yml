@@ -1,0 +1,77 @@
+#Requires -RunAsAdministrator
+# setup-win-vm.ps1 — Windows 11 Pro host, Hyper-V VM com GPU-P
+# 24 GB RAM / 500 GB disco / GPU particionada
+# roda: PowerShell como Administrador → .\setup-win-vm.ps1
+
+$ErrorActionPreference = "Stop"
+$VMName   = "Win11-VM"
+$VMPath   = "C:\VMs"
+$VHDX     = "$VMPath\$VMName.vhdx"
+$VMSwitch = "Default Switch"
+
+# --- 1. Verificar edição ---
+$ed = (Get-ComputerInfo).WindowsProductName
+if ($ed -notmatch "Pro|Enterprise|Education") {
+    Write-Host "Precisa Windows 11 Pro/Enterprise. Você tem: $ed" -ForegroundColor Red
+    exit 1
+}
+
+# --- 2. Habilitar Hyper-V ---
+$hv = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All
+if ($hv.State -ne "Enabled") {
+    Write-Host "Habilitando Hyper-V..." -ForegroundColor Yellow
+    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
+    Write-Host "REINICIE e rode o script de novo." -ForegroundColor Yellow
+    exit 0
+}
+
+# --- 3. Pasta ---
+New-Item -ItemType Directory -Path $VMPath -Force | Out-Null
+
+# --- 4. VHDX 500 GB dinâmico ---
+if (-not (Test-Path $VHDX)) {
+    New-VHD -Path $VHDX -SizeBytes 500GB -Dynamic | Out-Null
+    Write-Host "Disco criado: $VHDX (500 GB dinâmico)" -ForegroundColor Green
+}
+
+# --- 5. Criar (ou recriar) a VM ---
+if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
+    Write-Host "VM existente — recriando..." -ForegroundColor Yellow
+    Stop-VM -Name $VMName -Force -ErrorAction SilentlyContinue
+    Remove-VM -Name $VMName -Force
+}
+New-VM -Name $VMName -MemoryStartupBytes 24GB -VHDPath $VHDX -SwitchName $VMSwitch -Generation 2 | Out-Null
+
+# --- 6. CPU + RAM fixa ---
+Set-VM -Name $VMName -ProcessorCount 12
+Set-VM -Name $VMName -StaticMemory
+
+# --- 7. TPM 2.0 (Win11 exige) ---
+Set-VMKeyProtector -VMName $VMName -NewLocalKeyProtector
+Enable-VMTPM -VMName $VMName
+
+# --- 8. GPU-P ---
+$gpu = Get-VMHostPartitionableGpu
+if ($gpu) {
+    Write-Host "GPU detectada: $($gpu[0].Name)" -ForegroundColor Green
+    Set-VM -GuestControlledCacheTypes $true   -VMName $VMName
+    Set-VM -LowMemoryMappedIoSpace  1GB      -VMName $VMName
+    Set-VM -HighMemoryMappedIoSpace 33GB     -VMName $VMName
+    Add-VMGpuPartitionAdapter -VMName $VMName
+} else {
+    Write-Host "Nenhuma GPU particionável — VM ficaria sem GPU real." -ForegroundColor Yellow
+}
+
+# --- 9. ISO do Windows ---
+Write-Host ""
+Write-Host "Baixe a ISO do Windows 11 Pro: https://www.microsoft.com/software-download/windows11" -ForegroundColor Cyan
+$iso = Read-Host "Caminho da ISO (ou Enter pra pular)"
+if ($iso -and (Test-Path $iso)) {
+    Add-VMDvdDrive -VMName $VMName -Path $iso
+    $dvd = Get-VMDvdDrive -VMName $VMName
+    Set-VMFirmware -VMName $VMName -FirstBootDevice $dvd
+}
+
+Write-Host ""
+Write-Host "Pronto. Rode: Start-VM $VMName ; vmconnect localhost $VMName" -ForegroundColor Green
+Write-Host "Depois de instalar o Windows, rode: .\copy-gpu-drivers.ps1" -ForegroundColor Green
